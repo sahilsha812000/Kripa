@@ -4,6 +4,7 @@ import io
 import json
 import os
 import tempfile
+import threading
 import unittest
 
 from kripa.agent_manager import AgentDefinition, AgentManagerStore, AgentRegistry
@@ -119,6 +120,46 @@ class SkillManagerTests(unittest.TestCase):
         self.assertTrue(incompatible.compatibility_issues)
         with self.assertRaisesRegex(ValueError, "incompatible"):
             self.manager.install(self.package, approval_digest=incompatible.sha256)
+
+    def test_concurrent_skill_operations_preserve_state(self):
+        """Concurrent skill enable/disable operations use the protected transaction path and do not lose state."""
+        inspection = self.manager.inspect(self.package)
+        self.manager.install(self.package, approval_digest=inspection.sha256)
+        pkg2 = os.path.join(self.root, "second-helper")
+        os.makedirs(pkg2, exist_ok=True)
+        manifest = {
+            "schema_version": 1, "skill_id": "second-helper", "name": "Second Helper",
+            "description": "Second", "version": "1.0.0", "entrypoint": "SKILL.md",
+            "compatibility": {"kripa_min_version": "0.1.0"},
+        }
+        with open(os.path.join(pkg2, "skill.json"), "w", encoding="utf-8") as f:
+            json.dump(manifest, f)
+        with open(os.path.join(pkg2, "SKILL.md"), "w", encoding="utf-8") as f:
+            f.write("# Second helper\n")
+        insp2 = self.manager.inspect(pkg2)
+        self.manager.install(pkg2, approval_digest=insp2.sha256)
+
+        errors = []
+        def op1():
+            try:
+                self.manager.disable("writing-helper")
+            except Exception as e:
+                errors.append(e)
+
+        def op2():
+            try:
+                self.manager.enable("second-helper")
+            except Exception as e:
+                errors.append(e)
+
+        t1 = threading.Thread(target=op1)
+        t2 = threading.Thread(target=op2)
+        t1.start(); t2.start()
+        t1.join(); t2.join()
+
+        self.assertEqual(errors, [])
+        self.assertFalse(self.manager.get_skill("writing-helper").enabled)
+        self.assertTrue(self.manager.get_skill("second-helper").enabled)
 
     def test_cli_inspection_redacts_possible_credentials_and_install_is_approved(self):
         self.write_package(instructions="OPENAI_API_KEY=sk-abcdefghijk1234567890")

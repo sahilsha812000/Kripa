@@ -3,6 +3,7 @@
 import io
 import os
 import tempfile
+import threading
 import unittest
 
 from kripa.agent_manager import (
@@ -69,6 +70,87 @@ class AgentRegistryTests(unittest.TestCase):
     def test_registry_rejects_invalid_definition_type(self):
         with self.assertRaises(TypeError):
             self.registry.create_agent({"agent_id": "writer"})
+
+    def test_concurrent_create_agent_preserves_every_agent(self):
+        """Concurrent AgentRegistry.create_agent calls must preserve every agent without lost updates."""
+        agents_to_create = [
+            AgentDefinition("agent-{}".format(i), "Agent {}".format(i), "", "Instructions")
+            for i in range(8)
+        ]
+        errors = []
+
+        def worker(agent_def):
+            try:
+                self.registry.create_agent(agent_def)
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker, args=(a,)) for a in agents_to_create]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertEqual(errors, [])
+        persisted_ids = {a.agent_id for a in self.registry.list_agents()}
+        expected_ids = {a.agent_id for a in agents_to_create}
+        self.assertEqual(persisted_ids, expected_ids)
+
+    def test_concurrent_create_same_agent_allows_only_one(self):
+        """Only one concurrent creator succeeds for the same agent ID; others get AgentAlreadyExistsError."""
+        definition = AgentDefinition("same-agent", "Same Agent", "", "Instructions")
+        successes = []
+        already_exists = []
+        other_errors = []
+
+        def worker():
+            try:
+                self.registry.create_agent(definition)
+                successes.append(True)
+            except AgentAlreadyExistsError:
+                already_exists.append(True)
+            except Exception as exc:
+                other_errors.append(exc)
+
+        threads = [threading.Thread(target=worker) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertEqual(other_errors, [])
+        self.assertEqual(len(successes), 1)
+        self.assertEqual(len(already_exists), 7)
+        self.assertEqual(len(self.registry.list_agents()), 1)
+
+    def test_concurrent_update_and_retire_do_not_lose_updates(self):
+        """Concurrent update and retire operations do not overwrite each other."""
+        self.registry.create_agent(AgentDefinition("agent-a", "Agent A", "", "Instructions"))
+        self.registry.create_agent(AgentDefinition("agent-b", "Agent B", "", "Instructions"))
+        errors = []
+
+        def updater():
+            try:
+                self.registry.update_agent("agent-a", name="Updated Agent A")
+            except Exception as exc:
+                errors.append(exc)
+
+        def retirer():
+            try:
+                self.registry.retire_agent("agent-b")
+            except Exception as exc:
+                errors.append(exc)
+
+        t1 = threading.Thread(target=updater)
+        t2 = threading.Thread(target=retirer)
+        t1.start(); t2.start()
+        t1.join(); t2.join()
+
+        self.assertEqual(errors, [])
+        agent_a = self.registry.get_agent("agent-a")
+        agent_b = self.registry.get_agent("agent-b")
+        self.assertEqual(agent_a.name, "Updated Agent A")
+        self.assertFalse(agent_b.enabled)
 
 
 class AgentRegistryCliTests(unittest.TestCase):

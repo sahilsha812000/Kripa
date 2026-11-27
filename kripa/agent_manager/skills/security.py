@@ -1,4 +1,21 @@
-"""Conservative checks for local, non-executable skill packages."""
+"""Conservative checks for local, non-executable skill packages.
+
+Secret-detection limitation
+----------------------------
+The ``secret_findings`` function applies a fixed set of regular-expression
+patterns that target common credential formats (OpenAI-style ``sk-`` keys,
+Google ``AIza`` keys, Groq ``gsk_`` keys, OpenRouter ``sk-or-v1-`` keys,
+PEM private-key headers, and ``api_key``/``password``/``bearer`` label-value
+pairs).
+
+**These patterns are intentionally conservative, not comprehensive.**  They
+are designed to catch accidental inclusion of well-known credential shapes,
+not to serve as a general data-loss-prevention (DLP) system.  Arbitrary
+sensitive text that does not match any pattern will pass through without
+detection.  Callers that need broader protection must apply additional
+application-level controls; they must not rely on this function alone as a
+guarantee that no secret is ever stored or transmitted.
+"""
 
 import re
 

@@ -520,5 +520,117 @@ class AgentRuntimeCliTests(unittest.TestCase):
         self.assertEqual(errors.getvalue(), "")
 
 
+class TaskRedactionTests(unittest.TestCase):
+    """Step 1 security regression: credential-shaped task text must never be persisted."""
+
+    # ---- helpers ----
+
+    def _runtime(self, task_response="Done."):
+        repository = FakeRepository((active_agent(),))
+        provider = FakeProvider(task_response)
+        return AgentRuntime(repository, provider_factory=lambda: provider), repository
+
+    # ---- credential pattern fixtures ----
+    # Each string exercises one of the _SECRET_PATTERNS in security.py so that
+    # future pattern changes are caught by these tests.
+
+    _CREDENTIALS = [
+        # Pattern 1: api_key / access_token / client_secret / password label + value
+        "api_key: sk-does-not-matter-here",
+        "access_token=eyJhbGciOiJSUzI1NiIsInR5cCI",
+        "client_secret: super-long-secret-value-here",
+        "password=correct-horse-battery-staple",
+        # Pattern 2: Bearer token
+        "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.payload",
+        # Pattern 3: provider-specific key prefixes
+        "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",           # OpenAI-style
+        "sk-or-v1-" + "a" * 25,                               # OpenRouter-style
+        "gsk_" + "B" * 20,                                    # Groq-style
+        "AIza" + "C" * 32,                                    # Google-style
+        # Pattern 4: PEM private key header
+        "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA...",
+        "-----BEGIN PRIVATE KEY-----\nMIIEvgIBADANBgk...",
+        "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXk...",
+    ]
+
+    def test_task_containing_credential_pattern_is_rejected_before_persisting(self):
+        """Every known credential pattern must trigger a ValueError from create_run()."""
+        runtime, repository = self._runtime()
+        for credential in self._CREDENTIALS:
+            with self.subTest(credential=credential[:40]):
+                task = "Please do something with this key: " + credential
+                with self.assertRaises(ValueError) as ctx:
+                    runtime.create_run("writer", task)
+                # Error must be a fixed, non-revealing message.
+                self.assertIn("sensitive content", str(ctx.exception))
+                # The credential value must not appear in the error message.
+                self.assertNotIn(credential[:20], str(ctx.exception))
+        # No run must have been stored.
+        self.assertEqual(len(repository.runs), 0)
+
+    def test_task_with_no_credential_pattern_is_persisted_normally(self):
+        """Clean tasks must pass through create_run() without modification."""
+        runtime, repository = self._runtime()
+        clean_tasks = [
+            "What is the weather today?",
+            "Summarise this document in three bullet points.",
+            "My password manager is 1Password.",        # label without a value is fine
+            "api_key",                                  # label alone — no separator + value
+            "password",                                 # standalone word — no value
+            "bearer",                                   # bare word — no token following
+            "sk-",                                      # prefix only — too short
+        ]
+        for task in clean_tasks:
+            with self.subTest(task=task[:40]):
+                run = runtime.create_run("writer", task)
+                self.assertEqual(run.task, task)
+                self.assertEqual(run.status, "pending")
+        self.assertEqual(len(repository.runs), len(clean_tasks))
+
+    def test_error_message_never_echoes_the_detected_credential(self):
+        """The ValueError message must not contain the raw credential text."""
+        runtime, _ = self._runtime()
+        secret = "sk-" + "x" * 40
+        task = "Here is my key: " + secret
+        with self.assertRaises(ValueError) as ctx:
+            runtime.create_run("writer", task)
+        message = str(ctx.exception)
+        self.assertNotIn(secret, message)
+        self.assertNotIn("sk-", message)
+
+    def test_task_scan_does_not_affect_provider_call_path(self):
+        """A clean task must still reach the provider and return a result normally."""
+        runtime, repository = self._runtime("Here is your answer.")
+        result = runtime.run("writer", "Summarise the following meeting notes.")
+        self.assertEqual(result.run.status, "completed")
+        self.assertEqual(result.response, "Here is your answer.")
+
+    def test_create_run_raises_before_agent_lookup_when_task_contains_credential(self):
+        """The secret scan fires before any store I/O, so a missing agent is irrelevant."""
+        runtime, repository = self._runtime()
+        # 'missing-agent' does not exist in the fake repository.
+        with self.assertRaises(ValueError) as ctx:
+            runtime.create_run("missing-agent", "api_key: some-secret-value-123456")
+        self.assertIn("sensitive content", str(ctx.exception))
+        # No agent lookup should have modified repository state.
+        self.assertEqual(len(repository.runs), 0)
+
+    def test_credential_scan_runs_before_disabled_agent_check(self):
+        """Secret detection must fire even when the agent is disabled."""
+        repository = FakeRepository((
+            AgentDefinition("retired", "Retired", "", "Instructions", enabled=False),
+        ))
+        runtime = AgentRuntime(repository, provider_factory=lambda: FakeProvider())
+        with self.assertRaises(ValueError) as ctx:
+            runtime.create_run("retired", "password=hunter2 do something")
+        self.assertIn("sensitive content", str(ctx.exception))
+
+    def test_run_via_run_shortcut_also_rejects_credential_task(self):
+        """AgentRuntime.run() calls create_run() and must propagate its ValueError."""
+        runtime, _ = self._runtime()
+        with self.assertRaises(ValueError):
+            runtime.run("writer", "api_key: leaked-value-here-99999")
+
+
 if __name__ == "__main__":
     unittest.main()

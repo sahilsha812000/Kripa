@@ -20,11 +20,20 @@ class AgentManagerRuntimeRepository:
         return self.skills.get_skill(skill_id)
 
     def create_run(self, run):
-        snapshot = self._snapshot()
-        if any(item.run_id == run.run_id for item in snapshot.runs):
-            raise ValueError("An agent run with that ID already exists.")
-        self.store.upsert("runs", run)
-        return run
+        def _mutate(snapshot):
+            if any(item.run_id == run.run_id for item in snapshot.runs):
+                raise ValueError("An agent run with that ID already exists.")
+            new_snapshot = type(snapshot)(
+                agents=snapshot.agents,
+                runs=(*snapshot.runs, run),
+                skills=snapshot.skills,
+                tools=snapshot.tools,
+                approvals=snapshot.approvals,
+                workflows=snapshot.workflows,
+            )
+            return new_snapshot, run
+
+        return self.store.transaction(_mutate)
 
     def get_run(self, run_id):
         for run in self._snapshot().runs:

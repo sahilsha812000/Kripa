@@ -124,10 +124,6 @@ class SkillManager:
             raise ValueError("Explicit human approval of the inspected package digest is required.")
         if not hmac.compare_digest(approval_digest.lower(), inspection.sha256):
             raise ValueError("Approval digest does not match the inspected skill package.")
-        snapshot = self._snapshot()
-        prior = next((skill for skill in snapshot.skills if skill.skill_id == inspection.skill_id), None)
-        if prior is not None and _version_tuple(inspection.version) <= _version_tuple(prior.version):
-            raise ValueError("Installed skill version must be newer than the registered version.")
         skill = SkillDefinition(
             skill_id=inspection.skill_id, name=inspection.name, description=inspection.description,
             version=inspection.version, instructions=inspection.instructions, source="local",
@@ -141,8 +137,25 @@ class SkillManager:
                 "discovery_source": "local_directory",
             },
         )
-        self.store.upsert("skills", skill)
-        return skill
+
+        def _mutate(snapshot):
+            self._validate_snapshot_integrity(snapshot)
+            prior = next((item for item in snapshot.skills if item.skill_id == inspection.skill_id), None)
+            if prior is not None and _version_tuple(inspection.version) <= _version_tuple(prior.version):
+                raise ValueError("Installed skill version must be newer than the registered version.")
+            records = [
+                item for item in snapshot.skills if item.skill_id != skill.skill_id
+            ]
+            records.append(skill)
+            new_snapshot = type(snapshot)(
+                agents=snapshot.agents, runs=snapshot.runs,
+                skills=tuple(records),
+                tools=snapshot.tools, approvals=snapshot.approvals,
+                workflows=snapshot.workflows,
+            )
+            return new_snapshot, skill
+
+        return self.store.transaction(_mutate)
 
     def list_skills(self, include_disabled=True):
         if not isinstance(include_disabled, bool):
@@ -164,33 +177,54 @@ class SkillManager:
         return self._set_enabled(skill_id, False)
 
     def remove(self, skill_id):
-        snapshot = self._snapshot()
-        target = next((item for item in snapshot.skills if item.skill_id == skill_id), None)
-        if target is None:
-            raise LookupError("Skill was not found.")
-        if any(skill_id in agent.skill_ids and agent.enabled for agent in snapshot.agents):
-            raise ValueError("Skill is assigned to an active agent; disable or update that agent first.")
-        self.store.save(type(snapshot)(
-            agents=snapshot.agents, runs=snapshot.runs,
-            skills=tuple(item for item in snapshot.skills if item.skill_id != skill_id),
-            tools=snapshot.tools, approvals=snapshot.approvals,
-            workflows=snapshot.workflows,
-        ))
-        return target
+        def _mutate(snapshot):
+            self._validate_snapshot_integrity(snapshot)
+            target = next((item for item in snapshot.skills if item.skill_id == skill_id), None)
+            if target is None:
+                raise LookupError("Skill was not found.")
+            if any(skill_id in agent.skill_ids and agent.enabled for agent in snapshot.agents):
+                raise ValueError("Skill is assigned to an active agent; disable or update that agent first.")
+            new_snapshot = type(snapshot)(
+                agents=snapshot.agents, runs=snapshot.runs,
+                skills=tuple(item for item in snapshot.skills if item.skill_id != skill_id),
+                tools=snapshot.tools, approvals=snapshot.approvals,
+                workflows=snapshot.workflows,
+            )
+            return new_snapshot, target
+
+        return self.store.transaction(_mutate)
 
     def _set_enabled(self, skill_id, enabled):
-        skill = self.get_skill(skill_id)
-        updated = replace(skill, enabled=enabled)
-        self.store.upsert("skills", updated)
-        return updated
+        def _mutate(snapshot):
+            self._validate_snapshot_integrity(snapshot)
+            skill = next((item for item in snapshot.skills if item.skill_id == skill_id), None)
+            if skill is None:
+                raise LookupError("Skill was not found.")
+            updated = replace(skill, enabled=enabled)
+            records = [
+                item for item in snapshot.skills if item.skill_id != skill_id
+            ]
+            records.append(updated)
+            new_snapshot = type(snapshot)(
+                agents=snapshot.agents, runs=snapshot.runs,
+                skills=tuple(records),
+                tools=snapshot.tools, approvals=snapshot.approvals,
+                workflows=snapshot.workflows,
+            )
+            return new_snapshot, updated
 
-    def _snapshot(self):
-        snapshot = self.store.load()
+        return self.store.transaction(_mutate)
+
+    def _validate_snapshot_integrity(self, snapshot):
         if snapshot.issues:
             raise ValueError("Agent Manager storage is incomplete or unsupported; no changes were made.")
         ids = [skill.skill_id for skill in snapshot.skills]
         if len(ids) != len(set(ids)):
             raise ValueError("Agent Manager storage contains duplicate skill IDs; no changes were made.")
+
+    def _snapshot(self):
+        snapshot = self.store.load()
+        self._validate_snapshot_integrity(snapshot)
         return snapshot
 
 

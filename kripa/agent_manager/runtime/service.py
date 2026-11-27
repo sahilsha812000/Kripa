@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from kripa.agent_manager.contracts import AgentRun, validate_id, validate_text
 from kripa.agent_manager.runtime.contracts import AgentExecutionResult, ToolRequest
 from kripa.agent_manager.runtime.repository import AgentManagerRuntimeRepository
+from kripa.agent_manager.skills.security import secret_findings
 from kripa.agent_manager.tools.contracts import ToolExecutionOutcome
 from kripa.agent_manager.tools.schema import canonical_json
 from kripa.engine.conversation import Message
@@ -38,11 +39,23 @@ class AgentRuntime:
         self._provider = None
 
     def create_run(self, agent_id, task):
-        """Persist a pending run for one active, explicitly selected agent."""
+        """Persist a pending run for one active, explicitly selected agent.
+
+        The task text is scanned for credential patterns before it is written
+        to disk.  If a possible secret is detected the run is refused with a
+        fixed, non-revealing error message.  The raw task string is never
+        modified; failing closed preserves the semantic meaning of the request
+        and prevents silent data loss.
+        """
         validate_id(agent_id, "agent_id")
         validate_text(task, "task")
         if len(task) > _MAX_TASK_CHARS:
             raise ValueError("task exceeds the supported size limit.")
+        if secret_findings(task):
+            raise ValueError(
+                "task text may contain sensitive content and cannot be persisted safely; "
+                "remove any credentials or secrets before submitting the task."
+            )
         agent = self.repository.get_agent(agent_id)
         if not agent.enabled:
             raise ValueError("The selected agent is disabled.")
